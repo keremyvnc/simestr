@@ -1,8 +1,11 @@
 import { useState } from 'react';
-import { Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
-import { uid } from '../../store';
+import { Modal, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
+import { notificationsSupported, REMINDER_OPTIONS, reminderSummary } from '../../notifications';
+import { DEFAULT_REMINDERS, normalizeReminders, uid } from '../../store';
 import { colors, courseColors, DAYS_SHORT, radius } from '../../theme';
 import type { Course, Session } from '../../types';
+import { FormScrollView, KeyboardAvoidingBackdrop } from '../KeyboardAware';
+import TimeField, { TimeWheel } from '../TimeField';
 
 export type CourseInput = Omit<Course, 'id' | 'createdAt'>;
 
@@ -21,7 +24,9 @@ interface Props {
   onSubmit: (value: CourseInput) => void;
 }
 
-const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
+const BACKDROP_COLOR = 'rgba(15, 23, 42, 0.45)';
+
+const TIME_RE =/^([01]\d|2[0-3]):([0-5]\d)$/;
 
 const toMinutes = (t: string) => {
   const [h, m] = t.split(':').map(Number);
@@ -46,6 +51,9 @@ export default function CourseForm({ visible, initial, onCancel, onSubmit }: Pro
   const [semester, setSemester] = useState(initial?.semester ?? '2026-2027 Güz');
   const [color, setColor] = useState(initial?.color ?? courseColors[0]);
   const [notes, setNotes] = useState(initial?.notes ?? '');
+  const [reminders, setReminders] = useState<number[]>(initial ? initial.reminders : DEFAULT_REMINDERS);
+  const toggleReminder = (value: number) =>
+    setReminders((list) => (list.includes(value) ? list.filter((v) => v !== value) : [...list, value]));
   const [sessions, setSessions] = useState<SessionDraft[]>(
     initial ? initial.sessions.map((s) => ({ ...s })) : [],
   );
@@ -53,6 +61,26 @@ export default function CourseForm({ visible, initial, onCancel, onSubmit }: Pro
 
   const updateSession = (id: string, patch: Partial<SessionDraft>) =>
     setSessions((list) => list.map((s) => (s.id === id ? { ...s, ...patch } : s)));
+
+  // iOS'ta açık olan saat tekerleği: "<oturumId>:start" | "<oturumId>:end"
+  const [openTime, setOpenTime] = useState<string | null>(null);
+  const toggleTime = (key: string) => setOpenTime((k) => (k === key ? null : key));
+
+  // Başlangıç değişince bitiş geride kalırsa süreyi koruyarak bitişi de kaydır
+  const changeStart = (s: SessionDraft, start: string) => {
+    const patch: Partial<SessionDraft> = { start };
+    const oldStart = normalizeTime(s.start);
+    const end = normalizeTime(s.end);
+    if (TIME_RE.test(start) && TIME_RE.test(end) && toMinutes(end) <= toMinutes(start)) {
+      const prevDuration =
+        TIME_RE.test(oldStart) && toMinutes(end) > toMinutes(oldStart) ? toMinutes(end) - toMinutes(oldStart) : 50;
+      const e = Math.min(toMinutes(start) + prevDuration, 23 * 60 + 55);
+      if (e > toMinutes(start)) {
+        patch.end = `${String(Math.floor(e / 60)).padStart(2, '0')}:${String(e % 60).padStart(2, '0')}`;
+      }
+    }
+    updateSession(s.id, patch);
+  };
 
   const validate = () => {
     const e: Record<string, string> = {};
@@ -95,16 +123,23 @@ export default function CourseForm({ visible, initial, onCancel, onSubmit }: Pro
       semester: semester.trim(),
       color,
       notes: notes.trim(),
+      reminders: normalizeReminders(reminders),
       sessions: cleanSessions,
-      status: initial?.status ?? 'active',
       letterGrade: initial?.letterGrade ?? null,
       assessments: initial?.assessments ?? [],
     });
   };
 
   return (
-    <Modal visible={visible} transparent animationType="fade" onRequestClose={onCancel}>
-      <View style={styles.backdrop}>
+    <Modal
+      visible={visible}
+      transparent
+      animationType="fade"
+      onRequestClose={onCancel}
+      statusBarTranslucent
+      navigationBarTranslucent
+    >
+      <KeyboardAvoidingBackdrop style={styles.backdrop} backdropColor={BACKDROP_COLOR}>
         <View style={styles.dialog}>
           <View style={styles.header}>
             <Text style={styles.title}>{initial ? 'Dersi Düzenle' : 'Yeni Ders'}</Text>
@@ -113,7 +148,7 @@ export default function CourseForm({ visible, initial, onCancel, onSubmit }: Pro
             </Pressable>
           </View>
 
-          <ScrollView style={styles.body} contentContainerStyle={{ paddingBottom: 8 }}>
+          <FormScrollView style={styles.body} contentContainerStyle={{ paddingBottom: 8 }}>
             <View style={styles.row}>
               <Field label="Ders kodu *" error={errors.code} style={{ flex: 1 }}>
                 <TextInput
@@ -202,26 +237,26 @@ export default function CourseForm({ visible, initial, onCancel, onSubmit }: Pro
                       <Text style={styles.removeText}>Kaldır</Text>
                     </Pressable>
                   </View>
-                  <View style={styles.row}>
-                    <Field label="Başlangıç" style={{ width: 110 }}>
-                      <TextInput
+                  <View style={[styles.row, { flexWrap: 'wrap' }]}>
+                    <Field label="Başlangıç" style={{ width: 100 }}>
+                      <TimeField
                         value={s.start}
-                        onChangeText={(t) => updateSession(s.id, { start: t })}
-                        placeholder="09:00"
-                        maxLength={5}
-                        style={[styles.input, err && styles.inputError]}
+                        onChange={(t) => changeStart(s, t)}
+                        error={!!err}
+                        active={openTime === `${s.id}:start`}
+                        onPress={() => toggleTime(`${s.id}:start`)}
                       />
                     </Field>
-                    <Field label="Bitiş" style={{ width: 110 }}>
-                      <TextInput
+                    <Field label="Bitiş" style={{ width: 100 }}>
+                      <TimeField
                         value={s.end}
-                        onChangeText={(t) => updateSession(s.id, { end: t })}
-                        placeholder="11:50"
-                        maxLength={5}
-                        style={[styles.input, err && styles.inputError]}
+                        onChange={(t) => updateSession(s.id, { end: t })}
+                        error={!!err}
+                        active={openTime === `${s.id}:end`}
+                        onPress={() => toggleTime(`${s.id}:end`)}
                       />
                     </Field>
-                    <Field label="Derslik" style={{ flex: 1 }}>
+                    <Field label="Derslik" style={{ flex: 1, minWidth: 120 }}>
                       <TextInput
                         value={s.room}
                         onChangeText={(t) => updateSession(s.id, { room: t })}
@@ -230,10 +265,43 @@ export default function CourseForm({ visible, initial, onCancel, onSubmit }: Pro
                       />
                     </Field>
                   </View>
+                  {openTime?.startsWith(`${s.id}:`) && (
+                    <TimeWheel
+                      key={openTime}
+                      value={openTime.endsWith(':start') ? s.start : s.end}
+                      onChange={(t) =>
+                        openTime.endsWith(':start') ? changeStart(s, t) : updateSession(s.id, { end: t })
+                      }
+                      onDone={() => setOpenTime(null)}
+                    />
+                  )}
                   {err && <Text style={styles.error}>{err}</Text>}
                 </View>
               );
             })}
+
+            {notificationsSupported && (
+              <Field label="Dersten önce hatırlat (birden fazla seçilebilir)">
+                <View style={[styles.dayRow, { marginBottom: 6 }]}>
+                  {[{ value: null, label: 'Kapalı' }, ...REMINDER_OPTIONS].map((o) => {
+                    // "Kapalı" hiçbir süre seçili değilken aktif görünür; basınca tümünü temizler
+                    const active = o.value === null ? reminders.length === 0 : reminders.includes(o.value);
+                    return (
+                      <Pressable
+                        key={o.label}
+                        accessibilityRole="checkbox"
+                        accessibilityState={{ checked: active }}
+                        onPress={() => (o.value === null ? setReminders([]) : toggleReminder(o.value))}
+                        style={[styles.dayChip, active && { backgroundColor: color, borderColor: color }]}
+                      >
+                        <Text style={[styles.dayChipText, active && { color: '#FFFFFF' }]}>{o.label}</Text>
+                      </Pressable>
+                    );
+                  })}
+                </View>
+                <Text style={styles.hint}>{reminderSummary(reminders)}</Text>
+              </Field>
+            )}
 
             <Field label="Notlar">
               <TextInput
@@ -242,10 +310,10 @@ export default function CourseForm({ visible, initial, onCancel, onSubmit }: Pro
                 multiline
                 numberOfLines={3}
                 placeholder="Ders hakkında notlar…"
-                style={[styles.input, { minHeight: 72, textAlignVertical: 'top' }]}
+                style={[styles.input, { minHeight: 72, maxHeight: 160, textAlignVertical: 'top' }]}
               />
             </Field>
-          </ScrollView>
+          </FormScrollView>
 
           <View style={styles.footer}>
             {Object.keys(errors).length > 0 && (
@@ -260,7 +328,7 @@ export default function CourseForm({ visible, initial, onCancel, onSubmit }: Pro
             </Pressable>
           </View>
         </View>
-      </View>
+      </KeyboardAvoidingBackdrop>
     </Modal>
   );
 }
@@ -287,11 +355,9 @@ function Field({
 
 const styles = StyleSheet.create({
   backdrop: {
-    flex: 1,
-    backgroundColor: 'rgba(15, 23, 42, 0.45)',
     alignItems: 'center',
     justifyContent: 'center',
-    padding: 24,
+    padding: 12,
   },
   dialog: {
     width: '100%',
@@ -305,14 +371,14 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingHorizontal: 24,
+    paddingHorizontal: 20,
     paddingVertical: 18,
     borderBottomWidth: 1,
     borderBottomColor: colors.border,
   },
   title: { fontSize: 20, fontWeight: '700', color: colors.text },
   close: { fontSize: 18, color: colors.textMuted },
-  body: { paddingHorizontal: 24, paddingTop: 18 },
+  body: { paddingHorizontal: 20, paddingTop: 18 },
   row: { flexDirection: 'row', gap: 12 },
   label: { fontSize: 12, fontWeight: '600', color: colors.textMuted, marginBottom: 6 },
   input: {
@@ -370,7 +436,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 10,
-    paddingHorizontal: 24,
+    paddingHorizontal: 20,
     paddingVertical: 16,
     borderTopWidth: 1,
     borderTopColor: colors.border,

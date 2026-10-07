@@ -1,10 +1,39 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
-import type { AppData, Course, Task } from './types';
+import type { AppData, Course, Settings, Task } from './types';
 
 const STORAGE_KEY = 'simestr:data:v1';
 
-const emptyData: AppData = { version: 1, courses: [], tasks: [] };
+export const DEFAULT_REMINDERS = [15];
+
+// Hatırlatma listesini tekrarsız, pozitif tam sayılar olarak büyükten küçüğe sıralar
+export const normalizeReminders = (list: number[]) =>
+  [...new Set(list.filter((n) => Number.isInteger(n) && n > 0))].sort((a, b) => b - a);
+
+type LegacyCourse = Omit<Course, 'reminders'> & { reminders?: number[]; reminder?: number | null; status?: unknown };
+
+// Eski tekli "reminder" alanını listeye çevirir: sayı → [n], null → [], hiç yoksa varsayılan
+function migrateReminders({ reminders, reminder }: LegacyCourse) {
+  if (Array.isArray(reminders)) return normalizeReminders(reminders);
+  if (reminder === undefined) return [...DEFAULT_REMINDERS];
+  return reminder === null ? [] : normalizeReminders([reminder]);
+}
+
+const emptyData: AppData = { version: 1, courses: [], tasks: [], settings: { notifications: true } };
+
+// Eski kayıtlarda bulunmayan alanları varsayılanlarla doldurur
+function migrate(raw: Partial<AppData>): AppData {
+  return {
+    ...emptyData,
+    ...raw,
+    settings: { ...emptyData.settings, ...raw.settings },
+    // Kaldırılan "durum" alanı eski kayıtlardan atılır; bütün dersler programda görünür
+    courses: ((raw.courses ?? []) as LegacyCourse[]).map((legacy) => {
+      const { status: _status, reminder: _reminder, ...c } = legacy;
+      return { ...c, reminders: migrateReminders(legacy) };
+    }),
+  };
+}
 
 export const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 
@@ -17,6 +46,7 @@ interface Store {
   addTask: (task: Omit<Task, 'id' | 'createdAt'>) => Task;
   updateTask: (id: string, patch: Partial<Task>) => void;
   deleteTask: (id: string) => void;
+  updateSettings: (patch: Partial<Settings>) => void;
 }
 
 const StoreContext = createContext<Store | null>(null);
@@ -28,7 +58,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     AsyncStorage.getItem(STORAGE_KEY)
       .then((raw) => {
-        if (raw) setData({ ...emptyData, ...JSON.parse(raw) });
+        if (raw) setData(migrate(JSON.parse(raw)));
       })
       .catch(() => {})
       .finally(() => setLoaded(true));
@@ -70,9 +100,13 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     setData((d) => ({ ...d, tasks: d.tasks.filter((t) => t.id !== id) }));
   }, []);
 
+  const updateSettings = useCallback((patch: Partial<Settings>) => {
+    setData((d) => ({ ...d, settings: { ...d.settings, ...patch } }));
+  }, []);
+
   return (
     <StoreContext.Provider
-      value={{ data, loaded, addCourse, updateCourse, deleteCourse, addTask, updateTask, deleteTask }}
+      value={{ data, loaded, addCourse, updateCourse, deleteCourse, addTask, updateTask, deleteTask, updateSettings }}
     >
       {children}
     </StoreContext.Provider>

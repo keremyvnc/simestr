@@ -1,5 +1,3 @@
-export type CourseStatus = 'active' | 'completed' | 'dropped';
-
 export interface Session {
   id: string;
   day: number; // 0 = Pazartesi ... 6 = Pazar
@@ -23,11 +21,11 @@ export interface Course {
   credits: number; // AKTS
   semester: string; // "2026-2027 Güz"
   color: string;
-  status: CourseStatus;
   letterGrade: string | null;
   sessions: Session[];
   assessments: Assessment[];
   notes: string;
+  reminders: number[]; // dersten kaç dakika önce bildirim (büyükten küçüğe, tekrarsız); boş = kapalı
   createdAt: number;
 }
 
@@ -44,10 +42,15 @@ export interface Task {
   createdAt: number;
 }
 
+export interface Settings {
+  notifications: boolean; // tüm ders hatırlatmaları için ana anahtar
+}
+
 export interface AppData {
   version: 1;
   courses: Course[];
   tasks: Task[];
+  settings: Settings;
 }
 
 export type Route = 'home' | 'courses';

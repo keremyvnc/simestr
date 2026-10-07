@@ -1,13 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { colors, DAYS_SHORT, radius } from '../../theme';
-import type { Course, CourseStatus } from '../../types';
-
-const STATUS_LABEL: Record<CourseStatus, string> = {
-  active: 'Aktif',
-  completed: 'Tamamlandı',
-  dropped: 'Bırakıldı',
-};
+import type { Course } from '../../types';
 
 interface Props {
   course: Course;
@@ -29,10 +23,7 @@ export default function CourseCard({ course, onEdit, onDelete }: Props) {
     <View style={styles.card}>
       <View style={[styles.stripe, { backgroundColor: course.color }]} />
       <View style={styles.content}>
-        <View style={styles.topRow}>
-          <Text style={[styles.code, { color: course.color }]}>{course.code}</Text>
-          <Text style={styles.status}>{STATUS_LABEL[course.status]}</Text>
-        </View>
+        <Text style={[styles.code, { color: course.color }]}>{course.code}</Text>
         <Text style={styles.name} numberOfLines={2}>
           {course.name}
         </Text>
@@ -80,23 +71,10 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: colors.border,
     overflow: 'hidden',
-    width: 300,
-    flexGrow: 1,
-    maxWidth: 420,
   },
   stripe: { width: 6 },
   content: { flex: 1, padding: 16 },
-  topRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   code: { fontSize: 13, fontWeight: '800', letterSpacing: 0.5 },
-  status: {
-    fontSize: 11,
-    fontWeight: '600',
-    color: colors.textMuted,
-    backgroundColor: colors.bg,
-    paddingHorizontal: 8,
-    paddingVertical: 2,
-    borderRadius: 999,
-  },
   name: { fontSize: 16, fontWeight: '700', color: colors.text, marginTop: 6, marginBottom: 6 },
   meta: { fontSize: 13, color: colors.textMuted, marginBottom: 2 },
   sessions: {

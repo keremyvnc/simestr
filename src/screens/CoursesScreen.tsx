@@ -4,20 +4,10 @@ import CourseCard from '../components/courses/CourseCard';
 import CourseForm, { type CourseInput } from '../components/courses/CourseForm';
 import { useStore } from '../store';
 import { colors, radius } from '../theme';
-import type { Course, CourseStatus } from '../types';
-
-type Filter = CourseStatus | 'all';
-
-const FILTERS: { value: Filter; label: string }[] = [
-  { value: 'active', label: 'Aktif' },
-  { value: 'completed', label: 'Tamamlanan' },
-  { value: 'dropped', label: 'Bırakılan' },
-  { value: 'all', label: 'Tümü' },
-];
+import type { Course } from '../types';
 
 export default function CoursesScreen() {
   const { data, addCourse, updateCourse, deleteCourse } = useStore();
-  const [filter, setFilter] = useState<Filter>('active');
   const [formOpen, setFormOpen] = useState(false);
   const [editing, setEditing] = useState<Course | null>(null);
   const [formKey, setFormKey] = useState(0);
@@ -39,12 +29,8 @@ export default function CoursesScreen() {
     closeForm();
   };
 
-  const courses = data.courses
-    .filter((c) => filter === 'all' || c.status === filter)
-    .sort((a, b) => a.code.localeCompare(b.code, 'tr'));
-
-  const countFor = (f: Filter) =>
-    f === 'all' ? data.courses.length : data.courses.filter((c) => c.status === f).length;
+  const courses = [...data.courses].sort((a, b) => a.code.localeCompare(b.code, 'tr'));
+  const totalCredits = data.courses.reduce((s, c) => s + c.credits, 0);
 
   return (
     <View style={{ flex: 1 }}>
@@ -53,8 +39,7 @@ export default function CoursesScreen() {
           <View>
             <Text style={styles.title}>Dersler</Text>
             <Text style={styles.subtitle}>
-              {data.courses.length} ders · {data.courses.filter((c) => c.status === 'active').reduce((s, c) => s + c.credits, 0)}{' '}
-              aktif AKTS
+              {data.courses.length} ders · {totalCredits} AKTS
             </Text>
           </View>
           <Pressable onPress={() => openForm(null)} style={styles.addBtn}>
@@ -62,28 +47,9 @@ export default function CoursesScreen() {
           </Pressable>
         </View>
 
-        <View style={styles.filters}>
-          {FILTERS.map((f) => {
-            const active = f.value === filter;
-            return (
-              <Pressable
-                key={f.value}
-                onPress={() => setFilter(f.value)}
-                style={[styles.chip, active && styles.chipActive]}
-              >
-                <Text style={[styles.chipText, active && styles.chipTextActive]}>
-                  {f.label} ({countFor(f.value)})
-                </Text>
-              </Pressable>
-            );
-          })}
-        </View>
-
         {courses.length === 0 ? (
           <View style={styles.empty}>
-            <Text style={styles.emptyTitle}>
-              {data.courses.length === 0 ? 'Henüz ders yok' : 'Bu filtrede ders yok'}
-            </Text>
+            <Text style={styles.emptyTitle}>Henüz ders yok</Text>
             <Text style={styles.emptyText}>
               Derslerini ve haftalık ders saatlerini ekle, ana sayfadaki programda görünsün.
             </Text>
@@ -119,7 +85,7 @@ export default function CoursesScreen() {
 }
 
 const styles = StyleSheet.create({
-  container: { padding: 32 },
+  container: { paddingHorizontal: 20, paddingTop: 16, paddingBottom: 24 },
   header: {
     flexDirection: 'row',
     justifyContent: 'space-between',
@@ -130,24 +96,12 @@ const styles = StyleSheet.create({
   subtitle: { fontSize: 14, color: colors.textMuted, marginTop: 4 },
   addBtn: {
     backgroundColor: colors.primary,
-    paddingHorizontal: 18,
+    paddingHorizontal: 16,
     paddingVertical: 10,
-    borderRadius: radius.sm,
+    borderRadius: 999,
   },
   addBtnText: { color: '#FFFFFF', fontWeight: '700', fontSize: 14 },
-  filters: { flexDirection: 'row', gap: 8, marginBottom: 20, flexWrap: 'wrap' },
-  chip: {
-    paddingHorizontal: 14,
-    paddingVertical: 7,
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: colors.border,
-    backgroundColor: colors.surface,
-  },
-  chipActive: { backgroundColor: colors.primary, borderColor: colors.primary },
-  chipText: { fontSize: 13, fontWeight: '600', color: colors.textMuted },
-  chipTextActive: { color: '#FFFFFF' },
-  grid: { flexDirection: 'row', flexWrap: 'wrap', gap: 16 },
+  grid: { gap: 12 },
   empty: {
     alignItems: 'center',
     paddingVertical: 64,

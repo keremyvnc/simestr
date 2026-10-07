@@ -1,23 +1,22 @@
-import { useEffect, useMemo, useState } from 'react';
-import { Modal, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import Ionicons from '@expo/vector-icons/Ionicons';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { Alert, Modal, Pressable, ScrollView, StyleSheet, Text, useWindowDimensions, View } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { ensurePermission, notificationsSupported, reminderSummary } from '../notifications';
 import { useStore } from '../store';
-import { colors, DAYS, DAYS_SHORT, radius } from '../theme';
+import { colors, DAYS, radius } from '../theme';
 import type { Course, Route, Session } from '../types';
 
-const HOUR_HEIGHT = 56;
-const AXIS_WIDTH = 56;
 const MONTHS = [
   'Ocak', 'Şubat', 'Mart', 'Nisan', 'Mayıs', 'Haziran',
   'Temmuz', 'Ağustos', 'Eylül', 'Ekim', 'Kasım', 'Aralık',
 ];
 
-interface Block {
+interface Item {
   course: Course;
   session: Session;
   startMin: number;
   endMin: number;
-  col: number;
-  cols: number;
 }
 
 const toMinutes = (t: string) => {
@@ -40,12 +39,11 @@ const addDays = (d: Date, n: number) => {
 const sameDay = (a: Date, b: Date) =>
   a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
 
+const todayIndexOf = (d: Date) => (d.getDay() + 6) % 7;
+
 function formatRange(start: Date, end: Date) {
-  if (start.getFullYear() !== end.getFullYear()) {
-    return `${start.getDate()} ${MONTHS[start.getMonth()]} ${start.getFullYear()} – ${end.getDate()} ${MONTHS[end.getMonth()]} ${end.getFullYear()}`;
-  }
   if (start.getMonth() !== end.getMonth()) {
-    return `${start.getDate()} ${MONTHS[start.getMonth()]} – ${end.getDate()} ${MONTHS[end.getMonth()]} ${end.getFullYear()}`;
+    return `${start.getDate()} ${MONTHS[start.getMonth()]} – ${end.getDate()} ${MONTHS[end.getMonth()]}`;
   }
   return `${start.getDate()} – ${end.getDate()} ${MONTHS[end.getMonth()]} ${end.getFullYear()}`;
 }
@@ -57,396 +55,446 @@ function tint(hex: string, alpha: number) {
   return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${alpha})`;
 }
 
-// Çakışan oturumları yan yana sütunlara yerleştirir.
-function layoutDay(items: Omit<Block, 'col' | 'cols'>[]): Block[] {
-  const sorted = [...items].sort((a, b) => a.startMin - b.startMin || b.endMin - a.endMin);
-  const result: Block[] = [];
-  let cluster: Block[] = [];
-  let colEnds: number[] = [];
-  let clusterEnd = -1;
+const TIME_COL_ESTIMATE = 60;
+const GAP = 8;
+const HEADER_H = 52;
+const CARD_H = 112;
+const MIN_COL = 96; // bundan dar sütun gerekiyorsa tablo yana kaydırılır
+const SCROLL_COL = 112;
 
-  const flush = () => {
-    const cols = colEnds.length;
-    cluster.forEach((b) => (b.cols = cols));
-    result.push(...cluster);
-    cluster = [];
-    colEnds = [];
-  };
-
-  for (const item of sorted) {
-    if (cluster.length && item.startMin >= clusterEnd) flush();
-    let col = colEnds.findIndex((end) => end <= item.startMin);
-    if (col === -1) {
-      col = colEnds.length;
-      colEnds.push(item.endMin);
-    } else {
-      colEnds[col] = item.endMin;
-    }
-    cluster.push({ ...item, col, cols: 1 });
-    clusterEnd = Math.max(clusterEnd, item.endMin);
-  }
-  if (cluster.length) flush();
-  return result;
+// Bir zaman bandı: saatleri birbirine değen/çakışan derslerin oluşturduğu satır
+interface Slot {
+  key: string;
+  start: string;
+  end: string;
+  startMin: number;
+  endMin: number;
+  cells: Item[][]; // gösterilen gün sütunlarına göre
 }
 
+const rowHeight = (slot: Slot) => {
+  const stack = Math.max(1, ...slot.cells.map((c) => c.length));
+  return stack * CARD_H + (stack - 1) * 6;
+};
+
 export default function HomeScreen({ onNavigate }: { onNavigate: (r: Route) => void }) {
-  const { data } = useStore();
-  const [weekStart, setWeekStart] = useState(() => mondayOf(new Date()));
+  const { data, updateSettings } = useStore();
+  const { width } = useWindowDimensions();
   const [now, setNow] = useState(() => new Date());
-  const [selected, setSelected] = useState<Block | null>(null);
+  const [weekStart, setWeekStart] = useState(() => mondayOf(new Date()));
+  const [selected, setSelected] = useState<Item | null>(null);
+  const [gridWidth, setGridWidth] = useState<number | null>(null);
+  const gridScroll = useRef<ScrollView>(null);
 
   useEffect(() => {
     const t = setInterval(() => setNow(new Date()), 60_000);
     return () => clearInterval(t);
   }, []);
 
-  const activeCourses = useMemo(() => data.courses.filter((c) => c.status === 'active'), [data.courses]);
-
-  const items = useMemo(
-    () =>
-      activeCourses.flatMap((course) =>
-        course.sessions
-          .map((session) => ({ course, session, startMin: toMinutes(session.start), endMin: toMinutes(session.end) }))
-          .filter((b) => b.endMin > b.startMin && b.session.day >= 0 && b.session.day <= 6),
-      ),
-    [activeCourses],
-  );
-
-  const { startHour, endHour } = useMemo(() => {
-    let s = 8;
-    let e = 20;
-    for (const b of items) {
-      s = Math.min(s, Math.floor(b.startMin / 60));
-      e = Math.max(e, Math.ceil(b.endMin / 60));
+  const items = useMemo(() => {
+    const list: Item[] = [];
+    for (const course of data.courses) {
+      for (const session of course.sessions) {
+        const startMin = toMinutes(session.start);
+        const endMin = toMinutes(session.end);
+        if (endMin > startMin && session.day >= 0 && session.day <= 6) {
+          list.push({ course, session, startMin, endMin });
+        }
+      }
     }
-    return { startHour: Math.max(0, s), endHour: Math.min(24, e) };
-  }, [items]);
+    return list;
+  }, [data.courses]);
 
-  const blocksByDay = useMemo(
-    () => DAYS.map((_, day) => layoutDay(items.filter((b) => b.session.day === day))),
+  // Hafta içi her zaman, hafta sonu yalnızca dersi varsa gösterilir
+  const days = useMemo(
+    () => DAYS.map((_, i) => i).filter((i) => i < 5 || items.some((b) => b.session.day === i)),
     [items],
   );
 
-  const totalMinutes = items.reduce((sum, b) => sum + (b.endMin - b.startMin), 0);
+  // Saatleri çakışan oturumlar (hangi günde olursa olsun) tek bir zaman bandında toplanır;
+  // ör. 19:45–21:50 ve 19:55–20:30 aynı satırda, 19:45–21:50 bandında görünür
+  const slots = useMemo(() => {
+    const sorted = [...items].sort((a, b) => a.startMin - b.startMin || b.endMin - a.endMin);
+    const list: Slot[] = [];
+    for (const b of sorted) {
+      let slot = list[list.length - 1];
+      if (!slot || b.startMin >= slot.endMin) {
+        slot = { key: b.session.start, start: b.session.start, end: b.session.end, startMin: b.startMin, endMin: b.endMin, cells: days.map(() => []) };
+        list.push(slot);
+      } else if (b.endMin > slot.endMin) {
+        slot.end = b.session.end;
+        slot.endMin = b.endMin;
+      }
+      slot.cells[days.indexOf(b.session.day)].push(b);
+    }
+    list.forEach((slot) =>
+      slot.cells.forEach((c) =>
+        c.sort((a, b) => a.startMin - b.startMin || a.course.code.localeCompare(b.course.code, 'tr')),
+      ),
+    );
+    return list;
+  }, [items, days]);
+
   const weekDates = DAYS.map((_, i) => addDays(weekStart, i));
-  const todayIndex = weekDates.findIndex((d) => sameDay(d, now));
-  const nowMin = now.getHours() * 60 + now.getMinutes();
-  const showNowLine = todayIndex !== -1 && nowMin >= startHour * 60 && nowMin <= endHour * 60;
-  const hours = Array.from({ length: endHour - startHour }, (_, i) => startHour + i);
-  const gridHeight = (endHour - startHour) * HOUR_HEIGHT;
   const isCurrentWeek = sameDay(weekStart, mondayOf(now));
+  const todayIndex = isCurrentWeek ? todayIndexOf(now) : -1;
+  const nowMin = now.getHours() * 60 + now.getMinutes();
+  const courseCount = new Set(items.map((b) => b.course.id)).size;
+
+  // Ekrana sığıyorsa sütunlar genişliği paylaşır, sığmıyorsa sabit genişlikle yana kayar
+  // Ölçüm gelene kadar (ilk çizim) pencere genişliğinden tahmin edilir
+  const available = gridWidth ?? width - 32 - TIME_COL_ESTIMATE;
+  const fitWidth = (available - GAP * (days.length - 1)) / days.length;
+  const scrolls = fitWidth < MIN_COL;
+  const colW = scrolls ? SCROLL_COL : fitWidth;
+
+  // Kaydırılan tabloda bugünün sütunu görünür olsun
+  useEffect(() => {
+    const col = days.indexOf(todayIndex);
+    if (scrolls && col > 0) gridScroll.current?.scrollTo?.({ x: col * (colW + GAP), animated: false });
+  }, [scrolls, colW, todayIndex, days, slots.length]);
+
+  const goToday = () => setWeekStart(mondayOf(new Date()));
+
+  const notificationsOn = data.settings.notifications;
+  const toggleNotifications = async () => {
+    if (notificationsOn) {
+      updateSettings({ notifications: false });
+      return;
+    }
+    if (await ensurePermission()) {
+      updateSettings({ notifications: true });
+    } else {
+      Alert.alert('Bildirim izni yok', 'Ders hatırlatmaları için telefon ayarlarından Simestr bildirimlerine izin ver.');
+    }
+  };
 
   return (
     <View style={styles.screen}>
-      {/* Üst bar */}
+      {/* Başlık ve hafta gezinmesi */}
       <View style={styles.header}>
-        <View>
-          <Text style={styles.title}>Haftalık Program</Text>
-          <Text style={styles.subtitle}>{formatRange(weekDates[0], weekDates[6])}</Text>
+        <View style={{ flex: 1 }}>
+          <Text style={styles.title}>Program</Text>
+          <Text style={styles.subtitle}>
+            {formatRange(weekDates[0], weekDates[6])}
+            {courseCount > 0 ? ` · ${courseCount} ders` : ''}
+          </Text>
         </View>
-        <View style={styles.headerRight}>
-          <View style={styles.stat}>
-            <Text style={styles.statValue}>{activeCourses.length}</Text>
-            <Text style={styles.statLabel}>Aktif ders</Text>
-          </View>
-          <View style={styles.stat}>
-            <Text style={styles.statValue}>
-              {Math.floor(totalMinutes / 60)}
-              {totalMinutes % 60 ? `.${Math.round(((totalMinutes % 60) / 60) * 10)}` : ''} sa
-            </Text>
-            <Text style={styles.statLabel}>Haftalık ders saati</Text>
-          </View>
-          <View style={styles.navGroup}>
-            <Pressable style={styles.navBtn} onPress={() => setWeekStart((w) => addDays(w, -7))}>
-              <Text style={styles.navBtnText}>‹</Text>
-            </Pressable>
-            <Pressable
-              style={[styles.todayBtn, isCurrentWeek && styles.todayBtnDisabled]}
-              onPress={() => setWeekStart(mondayOf(new Date()))}
-            >
-              <Text style={[styles.todayBtnText, isCurrentWeek && { color: colors.textMuted }]}>Bugün</Text>
-            </Pressable>
-            <Pressable style={styles.navBtn} onPress={() => setWeekStart((w) => addDays(w, 7))}>
-              <Text style={styles.navBtnText}>›</Text>
-            </Pressable>
-          </View>
-        </View>
+        {!isCurrentWeek && (
+          <Pressable style={styles.todayBtn} onPress={goToday} hitSlop={6}>
+            <Text style={styles.todayBtnText}>Bugün</Text>
+          </Pressable>
+        )}
+        {notificationsSupported && (
+          <Pressable
+            style={styles.iconBtn}
+            onPress={toggleNotifications}
+            hitSlop={6}
+            accessibilityLabel={notificationsOn ? 'Hatırlatmaları kapat' : 'Hatırlatmaları aç'}
+          >
+            <Ionicons
+              name={notificationsOn ? 'notifications' : 'notifications-off-outline'}
+              size={19}
+              color={notificationsOn ? colors.primary : colors.textMuted}
+            />
+          </Pressable>
+        )}
+        <Pressable
+          style={styles.iconBtn}
+          onPress={() => setWeekStart((w) => addDays(w, -7))}
+          hitSlop={6}
+          accessibilityLabel="Önceki hafta"
+        >
+          <Ionicons name="chevron-back" size={20} color={colors.text} />
+        </Pressable>
+        <Pressable
+          style={styles.iconBtn}
+          onPress={() => setWeekStart((w) => addDays(w, 7))}
+          hitSlop={6}
+          accessibilityLabel="Sonraki hafta"
+        >
+          <Ionicons name="chevron-forward" size={20} color={colors.text} />
+        </Pressable>
       </View>
 
-      <View style={styles.calendar}>
-        {/* Gün başlıkları */}
-        <View style={styles.dayHeaderRow}>
-          <View style={{ width: AXIS_WIDTH }} />
-          {weekDates.map((d, i) => {
-            const isToday = i === todayIndex;
-            return (
-              <View key={i} style={[styles.dayHeader, isToday && styles.dayHeaderToday]}>
-                <Text style={[styles.dayName, isToday && { color: colors.primary }]}>{DAYS_SHORT[i]}</Text>
-                <View style={[styles.dayNum, isToday && styles.dayNumToday]}>
-                  <Text style={[styles.dayNumText, isToday && { color: '#FFFFFF' }]}>{d.getDate()}</Text>
-                </View>
-              </View>
-            );
-          })}
+      {slots.length === 0 ? (
+        <View style={styles.empty}>
+          <View style={styles.emptyIcon}>
+            <Ionicons name="calendar-outline" size={28} color={colors.primary} />
+          </View>
+          <Text style={styles.emptyTitle}>Henüz ders eklemedin</Text>
+          <Text style={styles.emptyText}>Derslerini ve saatlerini eklediğinde programın burada görünecek.</Text>
+          <Pressable style={styles.primaryBtn} onPress={() => onNavigate('courses')}>
+            <Text style={styles.primaryBtnText}>Ders ekle</Text>
+          </Pressable>
         </View>
-
-        <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingBottom: 12 }}>
-          <View style={[styles.gridRow, { height: gridHeight + 12 }]}>
-            {/* Saat ekseni */}
-            <View style={{ width: AXIS_WIDTH, height: gridHeight }}>
-              {hours.map((h, i) => (
-                <Text key={h} style={[styles.hourLabel, { top: i * HOUR_HEIGHT - 7 }]}>
-                  {String(h).padStart(2, '0')}:00
-                </Text>
+      ) : (
+        <ScrollView contentContainerStyle={styles.body}>
+          <View style={{ flexDirection: 'row' }}>
+            {/* Sabit saat sütunu: başlangıç üstte, bitiş altta */}
+            {/* Genişliği sabit değil, saat yazısına göre belirlenir; böylece büyük
+                yazı boyutunda bile saat alt satıra kaymaz */}
+            <View style={styles.timeCol}>
+              <View style={styles.dayHeaderSpacer} />
+              {slots.map((slot) => (
+                <View key={slot.key} style={[styles.timeCell, { height: rowHeight(slot) }]}>
+                  <Text style={styles.time} numberOfLines={1} maxFontSizeMultiplier={1.4}>
+                    {slot.start}
+                  </Text>
+                  <Text style={[styles.time, styles.timeEnd]} numberOfLines={1} maxFontSizeMultiplier={1.4}>
+                    {slot.end}
+                  </Text>
+                </View>
               ))}
             </View>
 
-            {/* Gün sütunları */}
-            {DAYS.map((_, day) => (
-              <View
-                key={day}
-                style={[styles.dayCol, { height: gridHeight }, day === todayIndex && styles.dayColToday]}
-              >
-                {hours.map((h, i) => (
-                  <View key={h} style={[styles.hourLine, { top: i * HOUR_HEIGHT }]} />
-                ))}
-                {blocksByDay[day].map((b) => {
-                  const top = ((b.startMin - startHour * 60) / 60) * HOUR_HEIGHT;
-                  const height = Math.max(((b.endMin - b.startMin) / 60) * HOUR_HEIGHT - 2, 20);
-                  const width = 100 / b.cols;
-                  const compact = height < 50;
-                  return (
-                    <Pressable
-                      key={b.session.id}
-                      onPress={() => setSelected(b)}
-                      style={(state) => [
-                        styles.block,
-                        {
-                          top,
-                          height,
-                          left: `${b.col * width}%`,
-                          width: `${width}%`,
-                          backgroundColor: tint(b.course.color, (state as { hovered?: boolean }).hovered ? 0.24 : 0.14),
-                          borderLeftColor: b.course.color,
-                        },
-                      ]}
-                    >
-                      <Text style={[styles.blockCode, { color: b.course.color }]} numberOfLines={1}>
-                        {b.course.code || b.course.name}
-                      </Text>
-                      {!compact && (
-                        <>
-                          <Text style={styles.blockName} numberOfLines={2}>
-                            {b.course.name}
-                          </Text>
-                          <Text style={styles.blockMeta} numberOfLines={1}>
-                            {b.session.start}–{b.session.end}
-                            {b.session.room ? ` · ${b.session.room}` : ''}
-                          </Text>
-                        </>
-                      )}
-                    </Pressable>
-                  );
-                })}
-                {showNowLine && day === todayIndex && (
-                  <View style={[styles.nowLine, { top: ((nowMin - startHour * 60) / 60) * HOUR_HEIGHT }]}>
-                    <View style={styles.nowDot} />
+            {/* Gün sütunları: saat sütunundan kalan gerçek genişliğe göre yerleşir */}
+            <ScrollView
+              ref={gridScroll}
+              horizontal
+              scrollEnabled={scrolls}
+              showsHorizontalScrollIndicator={false}
+              style={{ flex: 1 }}
+              onLayout={(e) => setGridWidth(e.nativeEvent.layout.width)}
+            >
+              <View>
+                <View style={[styles.gridRow, styles.dayHeaderRow]}>
+                  {days.map((d, ci) => {
+                    const busy = slots.some((s) => s.cells[ci].length > 0);
+                    const today = d === todayIndex;
+                    return (
+                      <View
+                        key={d}
+                        style={[
+                          styles.dayHeader,
+                          { width: colW, borderBottomColor: today ? colors.primary : busy ? colors.text : colors.border },
+                        ]}
+                      >
+                        <Text
+                          style={[styles.dayName, !busy && { color: colors.textMuted }, today && { color: colors.primary }]}
+                          numberOfLines={1}
+                        >
+                          {DAYS[d].toLocaleUpperCase('tr-TR')}
+                        </Text>
+                        <Text style={[styles.dayDate, today && { color: colors.primary }]}>
+                          {weekDates[d].getDate()} {MONTHS[weekDates[d].getMonth()].slice(0, 3)}
+                        </Text>
+                      </View>
+                    );
+                  })}
+                </View>
+
+                {slots.map((slot) => (
+                  <View key={slot.key} style={[styles.gridRow, { height: rowHeight(slot), marginBottom: GAP }]}>
+                    {slot.cells.map((cell, ci) => {
+                      if (cell.length === 0) {
+                        return <View key={ci} style={[styles.emptyCell, { width: colW }]} />;
+                      }
+                      const today = days[ci] === todayIndex;
+                      return (
+                        <View key={ci} style={{ width: colW, gap: 6 }}>
+                          {cell.map((b) => {
+                            const ongoing = today && nowMin >= b.startMin && nowMin < b.endMin;
+                            const past = today && nowMin >= b.endMin;
+                            // Saati bandın saatinden farklıysa kartta kendi saati yazılır
+                            const ownTime =
+                              b.startMin !== slot.startMin || b.endMin !== slot.endMin
+                                ? `${b.session.start}–${b.session.end}`
+                                : '';
+                            return (
+                              <Pressable
+                                key={b.session.id}
+                                onPress={() => setSelected(b)}
+                                style={({ pressed }) => [
+                                  styles.card,
+                                  {
+                                    height: cell.length === 1 ? rowHeight(slot) : CARD_H,
+                                    backgroundColor: tint(b.course.color, 0.12),
+                                    borderColor: b.course.color,
+                                  },
+                                  ongoing && styles.cardOngoing,
+                                  past && { opacity: 0.5 },
+                                  pressed && { opacity: 0.7 },
+                                ]}
+                              >
+                                <View style={[styles.codePill, { backgroundColor: b.course.color }]}>
+                                  <Text style={styles.codePillText} numberOfLines={1}>
+                                    {b.course.code}
+                                  </Text>
+                                </View>
+                                <Text style={styles.cardName} numberOfLines={ownTime ? 2 : 3}>
+                                  {b.course.name}
+                                </Text>
+                                <View style={{ flex: 1 }} />
+                                {ongoing ? (
+                                  <Text style={[styles.cardFoot, { color: b.course.color, fontWeight: '800' }]}>Şimdi</Text>
+                                ) : ownTime || b.session.room ? (
+                                  <Text style={styles.cardFoot} numberOfLines={1}>
+                                    {[ownTime, b.session.room].filter(Boolean).join(' · ')}
+                                  </Text>
+                                ) : null}
+                              </Pressable>
+                            );
+                          })}
+                        </View>
+                      );
+                    })}
                   </View>
-                )}
+                ))}
               </View>
-            ))}
+            </ScrollView>
           </View>
         </ScrollView>
+      )}
 
-        {items.length === 0 && (
-          <View style={styles.emptyOverlay} pointerEvents="box-none">
-            <View style={styles.emptyCard}>
-              <Text style={styles.emptyTitle}>Henüz ders eklemedin</Text>
-              <Text style={styles.emptyText}>
-                Derslerini ve gün/saatlerini eklediğinde haftalık programın burada görünecek.
-              </Text>
-              <Pressable style={styles.primaryBtn} onPress={() => onNavigate('courses')}>
-                <Text style={styles.primaryBtnText}>Ders ekle</Text>
-              </Pressable>
-            </View>
-          </View>
-        )}
-      </View>
-
-      {/* Ders detay paneli */}
-      <Modal visible={!!selected} transparent animationType="fade" onRequestClose={() => setSelected(null)}>
-        <Pressable style={styles.backdrop} onPress={() => setSelected(null)}>
-          {selected && (
-            <Pressable style={styles.detailCard} onPress={() => {}}>
-              <View style={[styles.detailStripe, { backgroundColor: selected.course.color }]} />
-              <Text style={[styles.detailCode, { color: selected.course.color }]}>{selected.course.code}</Text>
-              <Text style={styles.detailName}>{selected.course.name}</Text>
-              <View style={styles.detailRows}>
-                <DetailRow label="Öğretim üyesi" value={selected.course.instructor || '—'} />
-                <DetailRow label="AKTS" value={String(selected.course.credits ?? '—')} />
-                <DetailRow
-                  label="Gün / saat"
-                  value={`${DAYS[selected.session.day]}, ${selected.session.start}–${selected.session.end}`}
-                />
-                <DetailRow label="Derslik" value={selected.session.room || '—'} />
-                {selected.course.semester ? <DetailRow label="Dönem" value={selected.course.semester} /> : null}
-              </View>
-              <Pressable style={[styles.primaryBtn, { alignSelf: 'flex-end' }]} onPress={() => setSelected(null)}>
-                <Text style={styles.primaryBtnText}>Kapat</Text>
-              </Pressable>
-            </Pressable>
-          )}
-        </Pressable>
-      </Modal>
+      <DetailSheet item={selected} notificationsOn={notificationsOn} onClose={() => setSelected(null)} />
     </View>
   );
 }
 
-function DetailRow({ label, value }: { label: string; value: string }) {
+function DetailSheet({
+  item,
+  notificationsOn,
+  onClose,
+}: {
+  item: Item | null;
+  notificationsOn: boolean;
+  onClose: () => void;
+}) {
+  const insets = useSafeAreaInsets();
+  return (
+    <Modal visible={!!item} transparent animationType="slide" onRequestClose={onClose}>
+      <Pressable style={styles.backdrop} onPress={onClose}>
+        {item && (
+          <Pressable style={[styles.sheet, { paddingBottom: insets.bottom + 20 }]} onPress={() => {}}>
+            <View style={styles.handle} />
+            <Text style={[styles.cardCode, { color: item.course.color }]}>{item.course.code}</Text>
+            <Text style={styles.sheetTitle}>{item.course.name}</Text>
+            <View style={styles.sheetRows}>
+              <DetailRow
+                icon="time-outline"
+                value={`${DAYS[item.session.day]}, ${item.session.start}–${item.session.end}`}
+              />
+              <DetailRow icon="location-outline" value={item.session.room || 'Derslik belirtilmedi'} />
+              <DetailRow icon="person-outline" value={item.course.instructor || 'Öğretim üyesi belirtilmedi'} />
+              {notificationsSupported && (
+                <DetailRow
+                  icon="notifications-outline"
+                  value={
+                    notificationsOn
+                      ? reminderSummary(item.course.reminders)
+                      : 'Hatırlatmalar kapalı'
+                  }
+                />
+              )}
+              <DetailRow
+                icon="school-outline"
+                value={`${item.course.credits} AKTS${item.course.semester ? ` · ${item.course.semester}` : ''}`}
+              />
+            </View>
+            {item.course.notes ? <Text style={styles.sheetNotes}>{item.course.notes}</Text> : null}
+          </Pressable>
+        )}
+      </Pressable>
+    </Modal>
+  );
+}
+
+function DetailRow({ icon, value }: { icon: keyof typeof Ionicons.glyphMap; value: string }) {
   return (
     <View style={styles.detailRow}>
-      <Text style={styles.detailLabel}>{label}</Text>
+      <Ionicons name={icon} size={18} color={colors.textMuted} />
       <Text style={styles.detailValue}>{value}</Text>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  screen: { flex: 1, padding: 28, gap: 20 },
-  header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 16 },
-  title: { fontSize: 26, fontWeight: '800', color: colors.text },
-  subtitle: { fontSize: 14, color: colors.textMuted, marginTop: 4 },
-  headerRight: { flexDirection: 'row', alignItems: 'center', gap: 12 },
-  stat: {
-    backgroundColor: colors.surface,
-    borderWidth: 1,
-    borderColor: colors.border,
-    borderRadius: radius.md,
-    paddingVertical: 8,
-    paddingHorizontal: 14,
-    minWidth: 96,
-  },
-  statValue: { fontSize: 18, fontWeight: '800', color: colors.text },
-  statLabel: { fontSize: 11, color: colors.textMuted, marginTop: 2 },
-  navGroup: { flexDirection: 'row', alignItems: 'center', gap: 6, marginLeft: 8 },
-  navBtn: {
+  screen: { flex: 1 },
+  header: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 20, paddingTop: 16 },
+  title: { fontSize: 28, fontWeight: '800', color: colors.text },
+  subtitle: { fontSize: 13, color: colors.textMuted, marginTop: 2 },
+  iconBtn: {
     width: 36,
     height: 36,
-    borderRadius: radius.sm,
-    borderWidth: 1,
-    borderColor: colors.border,
+    borderRadius: 18,
     backgroundColor: colors.surface,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  navBtnText: { fontSize: 20, color: colors.text, lineHeight: 22 },
   todayBtn: {
     height: 36,
     paddingHorizontal: 14,
-    borderRadius: radius.sm,
+    borderRadius: 18,
     backgroundColor: colors.primarySoft,
     justifyContent: 'center',
+    marginRight: 2,
   },
-  todayBtnDisabled: { backgroundColor: colors.surface, borderWidth: 1, borderColor: colors.border },
   todayBtnText: { color: colors.primary, fontWeight: '700', fontSize: 13 },
 
-  calendar: {
-    flex: 1,
-    backgroundColor: colors.surface,
-    borderRadius: radius.lg,
-    borderWidth: 1,
-    borderColor: colors.border,
-    overflow: 'hidden',
-  },
-  dayHeaderRow: { flexDirection: 'row', borderBottomWidth: 1, borderBottomColor: colors.border },
-  dayHeader: { flex: 1, alignItems: 'center', paddingVertical: 10, gap: 4 },
-  dayHeaderToday: { backgroundColor: colors.primarySoft },
-  dayName: { fontSize: 12, fontWeight: '600', color: colors.textMuted, textTransform: 'uppercase' },
-  dayNum: { width: 30, height: 30, borderRadius: 15, alignItems: 'center', justifyContent: 'center' },
-  dayNumToday: { backgroundColor: colors.primary },
-  dayNumText: { fontSize: 15, fontWeight: '700', color: colors.text },
+  body: { paddingHorizontal: 16, paddingTop: 18, paddingBottom: 24 },
+  dayHeaderSpacer: { height: HEADER_H },
+  dayHeaderRow: { height: HEADER_H - GAP, marginBottom: GAP },
+  gridRow: { flexDirection: 'row', gap: GAP },
+  dayHeader: { alignItems: 'center', justifyContent: 'flex-end', paddingBottom: 6, borderBottomWidth: 2 },
+  dayName: { fontSize: 12, fontWeight: '800', letterSpacing: 0.8, color: colors.text },
+  dayDate: { fontSize: 11, color: colors.textMuted, marginTop: 1 },
 
-  gridRow: { flexDirection: 'row', paddingTop: 12 },
-  hourLabel: { position: 'absolute', right: 8, fontSize: 11, color: colors.textMuted },
-  dayCol: { flex: 1, borderLeftWidth: 1, borderLeftColor: colors.border, position: 'relative' },
-  dayColToday: { backgroundColor: 'rgba(79, 70, 229, 0.03)' },
-  hourLine: { position: 'absolute', left: 0, right: 0, height: 1, backgroundColor: colors.border },
+  timeCol: { minWidth: 52, flexShrink: 0, paddingRight: 10 },
+  timeCell: { marginBottom: GAP, paddingTop: 10, alignItems: 'flex-end' },
+  time: { fontSize: 15, fontWeight: '700', color: colors.text, fontVariant: ['tabular-nums'] },
+  timeEnd: { color: colors.textMuted, fontWeight: '600', marginTop: 2 },
 
-  block: {
-    position: 'absolute',
-    borderLeftWidth: 4,
-    borderRadius: radius.sm,
-    paddingVertical: 4,
-    paddingHorizontal: 6,
-    overflow: 'hidden',
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.9)',
-  },
-  blockCode: { fontSize: 12, fontWeight: '800' },
-  blockName: { fontSize: 12, color: colors.text, marginTop: 1 },
-  blockMeta: { fontSize: 11, color: colors.textMuted, marginTop: 2 },
+  emptyCell: { borderRadius: radius.lg, backgroundColor: '#EDEFF4' },
+  card: { borderRadius: radius.lg, borderWidth: 1.5, padding: 10, gap: 6, overflow: 'hidden' },
+  cardOngoing: { borderWidth: 2.5 },
+  codePill: { alignSelf: 'flex-start', borderRadius: 999, paddingHorizontal: 8, paddingVertical: 2, maxWidth: '100%' },
+  codePillText: { color: '#FFFFFF', fontSize: 11, fontWeight: '800', letterSpacing: 0.4 },
+  cardName: { fontSize: 14, fontWeight: '700', color: colors.text, lineHeight: 18 },
+  cardFoot: { fontSize: 12, color: colors.textMuted },
+  cardCode: { fontSize: 12, fontWeight: '800', letterSpacing: 0.4 },
 
-  nowLine: { position: 'absolute', left: 0, right: 0, height: 2, backgroundColor: colors.danger, zIndex: 10 },
-  nowDot: {
-    position: 'absolute',
-    left: -5,
-    top: -4,
-    width: 10,
-    height: 10,
-    borderRadius: 5,
-    backgroundColor: colors.danger,
-  },
-
-  emptyOverlay: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
+  empty: { alignItems: 'center', paddingVertical: 64, paddingHorizontal: 24, gap: 8 },
+  emptyIcon: {
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    backgroundColor: colors.primarySoft,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: 'rgba(246, 247, 251, 0.6)',
+    marginBottom: 4,
   },
-  emptyCard: {
-    backgroundColor: colors.surface,
-    borderRadius: radius.lg,
-    borderWidth: 1,
-    borderColor: colors.border,
-    padding: 28,
-    maxWidth: 380,
-    alignItems: 'center',
-    gap: 10,
-    shadowColor: '#000',
-    shadowOpacity: 0.08,
-    shadowRadius: 20,
-    shadowOffset: { width: 0, height: 8 },
-  },
-  emptyTitle: { fontSize: 18, fontWeight: '800', color: colors.text },
-  emptyText: { fontSize: 14, color: colors.textMuted, textAlign: 'center', lineHeight: 20, marginBottom: 6 },
+  emptyTitle: { fontSize: 16, fontWeight: '700', color: colors.text },
+  emptyText: { fontSize: 14, color: colors.textMuted, textAlign: 'center', maxWidth: 280, lineHeight: 20 },
   primaryBtn: {
     backgroundColor: colors.primary,
-    paddingVertical: 10,
-    paddingHorizontal: 18,
-    borderRadius: radius.sm,
+    paddingVertical: 11,
+    paddingHorizontal: 22,
+    borderRadius: 999,
+    marginTop: 8,
   },
   primaryBtnText: { color: '#FFFFFF', fontWeight: '700', fontSize: 14 },
 
-  backdrop: { flex: 1, backgroundColor: 'rgba(15, 23, 42, 0.45)', alignItems: 'center', justifyContent: 'center' },
-  detailCard: {
-    width: 380,
-    maxWidth: '90%',
+  backdrop: { flex: 1, backgroundColor: 'rgba(15, 23, 42, 0.4)', justifyContent: 'flex-end' },
+  sheet: {
     backgroundColor: colors.surface,
-    borderRadius: radius.lg,
-    padding: 24,
-    paddingTop: 28,
-    overflow: 'hidden',
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    paddingHorizontal: 24,
+    paddingTop: 10,
     gap: 4,
   },
-  detailStripe: { position: 'absolute', top: 0, left: 0, right: 0, height: 6 },
-  detailCode: { fontSize: 13, fontWeight: '800' },
-  detailName: { fontSize: 20, fontWeight: '800', color: colors.text },
-  detailRows: { marginVertical: 16, gap: 10 },
-  detailRow: { flexDirection: 'row', justifyContent: 'space-between', gap: 12 },
-  detailLabel: { fontSize: 13, color: colors.textMuted },
-  detailValue: { fontSize: 13, color: colors.text, fontWeight: '600', flexShrink: 1, textAlign: 'right' },
+  handle: {
+    alignSelf: 'center',
+    width: 40,
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: colors.border,
+    marginBottom: 14,
+  },
+  sheetTitle: { fontSize: 20, fontWeight: '800', color: colors.text },
+  sheetRows: { marginTop: 16, gap: 14 },
+  detailRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
+  detailValue: { fontSize: 15, color: colors.text, flexShrink: 1 },
+  sheetNotes: { fontSize: 14, color: colors.textMuted, marginTop: 16, lineHeight: 20 },
 });
